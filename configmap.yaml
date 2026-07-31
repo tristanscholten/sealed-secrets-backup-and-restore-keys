@@ -9,12 +9,12 @@ data:
 
     mode="${MODE:-orchestrate}"
     node_label="${BACKUP_NODE_LABEL:-sealed-secrets-backup=true}"
-    job_namespace="${POD_NAMESPACE:-sealed-secrets-backup}"
-    key_namespace="${SEALED_SECRETS_NAMESPACE:-${job_namespace}}"
+    key_namespace="${SEALED_SECRETS_NAMESPACE:-}"
     key_selector="${SEALED_SECRETS_KEY_SELECTOR:-sealedsecrets.bitnami.com/sealed-secrets-key}"
     backup_dir="${BACKUP_DIR:-/backup}"
     target_node="${TARGET_NODE:-}"
     node_name="${NODE_NAME:-}"
+    job_namespace="${POD_NAMESPACE:-sealed-secrets-backup}"
     s3_bucket="${S3_BUCKET:-}"
     s3_prefix="${S3_PREFIX:-sealed-secrets-backup}"
     s3_endpoint_url="${S3_ENDPOINT_URL:-}"
@@ -25,7 +25,18 @@ data:
     }
 
     sanitize_name() {
-      printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.-]/-/g; s/^[^a-z0-9]*//; s/[^a-z0-9]*$//; s/^$/node/' | cut -c1-25
+      printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.-]/-/g; s/^[^a-z0-9]*//; s/[^a-z0-9]*$//; s/^$/item/' | cut -c1-40
+    }
+
+    list_key_namespaces() {
+      if [ -n "${key_namespace}" ]; then
+        printf '%s\n' "${key_namespace}"
+        return
+      fi
+
+      kubectl get secrets --all-namespaces -l "${key_selector}" \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' \
+        | sed '/^$/d' | sort -u
     }
 
     labeled_nodes="$(list_labeled_nodes)"
@@ -184,53 +195,71 @@ data:
       exit 1
     fi
 
-    key_count="$(kubectl -n "${key_namespace}" get secrets -l "${key_selector}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-    if [ "${key_count}" -eq 0 ]; then
-      echo "ERROR: found no sealed-secrets private key secrets in ${key_namespace} with selector ${key_selector}." >&2
+    key_namespaces="$(list_key_namespaces)"
+    namespace_count="$(printf '%s\n' "${key_namespaces}" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [ "${namespace_count}" -eq 0 ]; then
+      echo "ERROR: found no sealed-secrets private key secrets with selector ${key_selector}." >&2
       exit 1
     fi
 
     mkdir -p "${backup_dir}"
     umask 077
-    tmp="${backup_dir}/sealed-secrets-keys.yaml.tmp"
-    latest="${backup_dir}/sealed-secrets-keys.yaml"
-    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-    stamped="${backup_dir}/sealed-secrets-keys-${stamp}.yaml"
-    meta="${backup_dir}/sealed-secrets-keys.latest.txt"
+    total_keys=0
 
-    kubectl -n "${key_namespace}" get secrets -l "${key_selector}" -o yaml > "${tmp}"
-    chmod 600 "${tmp}"
-    cp "${tmp}" "${stamped}"
-    chmod 600 "${stamped}"
-    mv "${tmp}" "${latest}"
-    chmod 600 "${latest}"
-
-    {
-      echo "timestamp=${stamp}"
-      echo "node=${target_node}"
-      echo "namespace=${key_namespace}"
-      echo "selector=${key_selector}"
-      echo "secret_count=${key_count}"
-      echo "latest=${latest}"
-      echo "stamped=${stamped}"
-    } > "${meta}"
-    chmod 600 "${meta}"
-
-    if [ -n "${s3_bucket}" ]; then
-      s3_node="$(sanitize_name "${target_node}")"
-      s3_base="s3://${s3_bucket}/${s3_prefix}/${s3_node}"
-      endpoint_args=""
-      if [ -n "${s3_endpoint_url}" ]; then
-        endpoint_args="--endpoint-url ${s3_endpoint_url}"
+    for namespace in ${key_namespaces}; do
+      key_count="$(kubectl -n "${namespace}" get secrets -l "${key_selector}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+      if [ "${key_count}" -eq 0 ]; then
+        echo "ERROR: found no sealed-secrets private key secrets in ${namespace} with selector ${key_selector}." >&2
+        exit 1
       fi
 
-      # shellcheck disable=SC2086
-      aws ${endpoint_args} s3 cp "${latest}" "${s3_base}/sealed-secrets-keys.yaml" --only-show-errors
-      # shellcheck disable=SC2086
-      aws ${endpoint_args} s3 cp "${stamped}" "${s3_base}/sealed-secrets-keys-${stamp}.yaml" --only-show-errors
-      # shellcheck disable=SC2086
-      aws ${endpoint_args} s3 cp "${meta}" "${s3_base}/sealed-secrets-keys.latest.txt" --only-show-errors
-      echo "OK: uploaded backup metadata and key files to ${s3_base}/."
-    fi
+      backup_id="$(sanitize_name "${namespace}")"
+      controller_backup_dir="${backup_dir}/${backup_id}"
+      mkdir -p "${controller_backup_dir}"
+      tmp="${controller_backup_dir}/sealed-secrets-keys.yaml.tmp"
+      latest="${controller_backup_dir}/sealed-secrets-keys.yaml"
+      stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+      stamped="${controller_backup_dir}/sealed-secrets-keys-${stamp}.yaml"
+      meta="${controller_backup_dir}/sealed-secrets-keys.latest.txt"
 
-    echo "OK: backed up ${key_count} sealed-secrets key secret(s) to ${latest} on node ${target_node}."
+      kubectl -n "${namespace}" get secrets -l "${key_selector}" -o yaml > "${tmp}"
+      chmod 600 "${tmp}"
+      cp "${tmp}" "${stamped}"
+      chmod 600 "${stamped}"
+      mv "${tmp}" "${latest}"
+      chmod 600 "${latest}"
+
+      {
+        echo "timestamp=${stamp}"
+        echo "backup_id=${backup_id}"
+        echo "node=${target_node}"
+        echo "namespace=${namespace}"
+        echo "selector=${key_selector}"
+        echo "secret_count=${key_count}"
+        echo "latest=${latest}"
+        echo "stamped=${stamped}"
+      } > "${meta}"
+      chmod 600 "${meta}"
+
+      if [ -n "${s3_bucket}" ]; then
+        s3_node="$(sanitize_name "${target_node}")"
+        s3_base="s3://${s3_bucket}/${s3_prefix}/${backup_id}/${s3_node}"
+        endpoint_args=""
+        if [ -n "${s3_endpoint_url}" ]; then
+          endpoint_args="--endpoint-url ${s3_endpoint_url}"
+        fi
+
+        # shellcheck disable=SC2086
+        aws ${endpoint_args} s3 cp "${latest}" "${s3_base}/sealed-secrets-keys.yaml" --only-show-errors
+        # shellcheck disable=SC2086
+        aws ${endpoint_args} s3 cp "${stamped}" "${s3_base}/sealed-secrets-keys-${stamp}.yaml" --only-show-errors
+        # shellcheck disable=SC2086
+        aws ${endpoint_args} s3 cp "${meta}" "${s3_base}/sealed-secrets-keys.latest.txt" --only-show-errors
+        echo "OK: uploaded backup metadata and key files to ${s3_base}/."
+      fi
+
+      total_keys=$((total_keys + key_count))
+      echo "OK: backed up ${key_count} sealed-secrets key secret(s) from namespace ${namespace} to ${latest} on node ${target_node}."
+    done
+
+    echo "OK: backed up ${total_keys} sealed-secrets key secret(s) from ${namespace_count} namespace(s) on node ${target_node}."
