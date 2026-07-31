@@ -2,43 +2,185 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: sealed-secrets-key-backup-script
-  namespace: sealed-secrets-backup
 data:
   backup.sh: |
     #!/bin/sh
     set -eu
 
-    mode="${MODE:-backup}"
+    mode="${MODE:-orchestrate}"
     node_label="${BACKUP_NODE_LABEL:-sealed-secrets-backup=true}"
-    key_namespace="${SEALED_SECRETS_NAMESPACE:-kube-system}"
+    job_namespace="${POD_NAMESPACE:-sealed-secrets-backup}"
+    key_namespace="${SEALED_SECRETS_NAMESPACE:-${job_namespace}}"
     key_selector="${SEALED_SECRETS_KEY_SELECTOR:-sealedsecrets.bitnami.com/sealed-secrets-key}"
     backup_dir="${BACKUP_DIR:-/backup}"
+    target_node="${TARGET_NODE:-}"
     node_name="${NODE_NAME:-}"
+    s3_bucket="${S3_BUCKET:-}"
+    s3_prefix="${S3_PREFIX:-sealed-secrets-backup}"
+    s3_endpoint_url="${S3_ENDPOINT_URL:-}"
+    worker_timeout="${WORKER_TIMEOUT:-180s}"
 
-    labeled_nodes="$(kubectl get nodes -l "${node_label}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
+    list_labeled_nodes() {
+      kubectl get nodes -l "${node_label}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sed '/^$/d'
+    }
+
+    sanitize_name() {
+      printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.-]/-/g; s/^[^a-z0-9]*//; s/[^a-z0-9]*$//; s/^$/node/' | cut -c1-25
+    }
+
+    labeled_nodes="$(list_labeled_nodes)"
     node_count="$(printf '%s\n' "${labeled_nodes}" | sed '/^$/d' | wc -l | tr -d ' ')"
 
     if [ "${node_count}" -eq 0 ]; then
-      echo "ERROR: no node has required label ${node_label}; label exactly one backup node." >&2
+      echo "ERROR: no node has required label ${node_label}; label one or more backup nodes." >&2
       exit 1
     fi
-
-    if [ "${node_count}" -gt 1 ]; then
-      echo "ERROR: multiple nodes have ${node_label}; label exactly one backup node." >&2
-      printf '%s\n' "${labeled_nodes}" >&2
-      exit 1
-    fi
-
-    target_node="$(printf '%s\n' "${labeled_nodes}" | sed '/^$/d' | head -n1)"
 
     if [ "${mode}" = "check" ]; then
-      echo "OK: backup node ${target_node} has ${node_label}."
+      echo "OK: ${node_count} backup node(s) have ${node_label}:"
+      printf '%s\n' "${labeled_nodes}"
       sleep 3600
       exit 0
     fi
 
+    if [ "${mode}" = "orchestrate" ]; then
+      stamp="$(date -u +%Y%m%d%H%M%S)"
+      created_jobs=""
+
+      for node in ${labeled_nodes}; do
+        short_node="$(sanitize_name "${node}")"
+        job_name="ss-key-backup-${short_node}-${stamp}"
+        created_jobs="${created_jobs} ${job_name}"
+
+        cat <<EOF | kubectl -n "${job_namespace}" apply -f -
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: ${job_name}
+      labels:
+        app.kubernetes.io/name: sealed-secrets-key-backup-worker
+        sealed-secrets-backup/run: "${stamp}"
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: sealed-secrets-key-backup-worker
+            sealed-secrets-backup/run: "${stamp}"
+        spec:
+          serviceAccountName: sealed-secrets-key-backup
+          automountServiceAccountToken: true
+          restartPolicy: OnFailure
+          nodeName: "${node}"
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              image: docker.io/alpine/k8s:1.35.0
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/scripts/backup.sh"]
+              env:
+                - name: MODE
+                  value: worker
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
+                - name: TARGET_NODE
+                  value: "${node}"
+                - name: BACKUP_NODE_LABEL
+                  value: "${node_label}"
+                - name: SEALED_SECRETS_NAMESPACE
+                  value: "${key_namespace}"
+                - name: SEALED_SECRETS_KEY_SELECTOR
+                  value: "${key_selector}"
+                - name: BACKUP_DIR
+                  value: "${backup_dir}"
+                - name: S3_BUCKET
+                  value: "${s3_bucket}"
+                - name: S3_PREFIX
+                  value: "${s3_prefix}"
+                - name: S3_ENDPOINT_URL
+                  value: "${s3_endpoint_url}"
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: sealed-secrets-key-backup-s3
+                      key: AWS_ACCESS_KEY_ID
+                      optional: true
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: sealed-secrets-key-backup-s3
+                      key: AWS_SECRET_ACCESS_KEY
+                      optional: true
+                - name: AWS_DEFAULT_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: sealed-secrets-key-backup-s3
+                      key: AWS_DEFAULT_REGION
+                      optional: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: backup
+                  mountPath: "${backup_dir}"
+          volumes:
+            - name: script
+              configMap:
+                name: sealed-secrets-key-backup-script
+                defaultMode: 0555
+            - name: backup
+              hostPath:
+                path: /var/lib/sealed-secrets-backup
+                type: DirectoryOrCreate
+    EOF
+      done
+
+      failed=0
+      for job in ${created_jobs}; do
+        if kubectl -n "${job_namespace}" wait --for=condition=complete "job/${job}" --timeout="${worker_timeout}"; then
+          echo "OK: worker ${job} completed."
+        else
+          failed=1
+          echo "ERROR: worker ${job} failed or timed out." >&2
+          kubectl -n "${job_namespace}" logs "job/${job}" --tail=80 >&2 || true
+        fi
+      done
+
+      if [ "${failed}" -ne 0 ]; then
+        exit 1
+      fi
+
+      echo "OK: backed up sealed-secrets keys to ${node_count} labeled node(s)."
+      exit 0
+    fi
+
+    if [ "${mode}" != "worker" ]; then
+      echo "ERROR: unsupported MODE=${mode}." >&2
+      exit 1
+    fi
+
+    if [ -z "${target_node}" ]; then
+      echo "ERROR: TARGET_NODE is required in worker mode." >&2
+      exit 1
+    fi
+
     if [ -n "${node_name}" ] && [ "${node_name}" != "${target_node}" ]; then
-      echo "ERROR: scheduled on ${node_name}, but labeled backup node is ${target_node}." >&2
+      echo "ERROR: scheduled on ${node_name}, but target backup node is ${target_node}." >&2
+      exit 1
+    fi
+
+    if ! printf '%s\n' "${labeled_nodes}" | grep -Fxq "${target_node}"; then
+      echo "ERROR: target node ${target_node} no longer has ${node_label}." >&2
       exit 1
     fi
 
@@ -73,5 +215,22 @@ data:
       echo "stamped=${stamped}"
     } > "${meta}"
     chmod 600 "${meta}"
+
+    if [ -n "${s3_bucket}" ]; then
+      s3_node="$(sanitize_name "${target_node}")"
+      s3_base="s3://${s3_bucket}/${s3_prefix}/${s3_node}"
+      endpoint_args=""
+      if [ -n "${s3_endpoint_url}" ]; then
+        endpoint_args="--endpoint-url ${s3_endpoint_url}"
+      fi
+
+      # shellcheck disable=SC2086
+      aws ${endpoint_args} s3 cp "${latest}" "${s3_base}/sealed-secrets-keys.yaml" --only-show-errors
+      # shellcheck disable=SC2086
+      aws ${endpoint_args} s3 cp "${stamped}" "${s3_base}/sealed-secrets-keys-${stamp}.yaml" --only-show-errors
+      # shellcheck disable=SC2086
+      aws ${endpoint_args} s3 cp "${meta}" "${s3_base}/sealed-secrets-keys.latest.txt" --only-show-errors
+      echo "OK: uploaded backup metadata and key files to ${s3_base}/."
+    fi
 
     echo "OK: backed up ${key_count} sealed-secrets key secret(s) to ${latest} on node ${target_node}."
