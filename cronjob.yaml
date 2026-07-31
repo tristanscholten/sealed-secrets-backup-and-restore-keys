@@ -2,7 +2,6 @@ apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: sealed-secrets-key-backup
-  namespace: sealed-secrets-backup
 spec:
   schedule: "17 3 * * *"
   concurrencyPolicy: Forbid
@@ -10,7 +9,7 @@ spec:
   failedJobsHistoryLimit: 5
   jobTemplate:
     spec:
-      backoffLimit: 1
+      backoffLimit: 0
       ttlSecondsAfterFinished: 86400
       template:
         metadata:
@@ -19,32 +18,40 @@ spec:
         spec:
           serviceAccountName: sealed-secrets-key-backup
           automountServiceAccountToken: true
-          restartPolicy: OnFailure
-          nodeSelector:
-            sealed-secrets-backup: "true"
+          restartPolicy: Never
           securityContext:
             seccompProfile:
               type: RuntimeDefault
           containers:
-            - name: backup
+            - name: orchestrator
               image: docker.io/alpine/k8s:1.35.0
               imagePullPolicy: IfNotPresent
               command: ["/bin/sh", "/scripts/backup.sh"]
               env:
                 - name: MODE
-                  value: backup
-                - name: NODE_NAME
+                  value: orchestrate
+                - name: POD_NAMESPACE
                   valueFrom:
                     fieldRef:
-                      fieldPath: spec.nodeName
+                      fieldPath: metadata.namespace
                 - name: BACKUP_NODE_LABEL
                   value: sealed-secrets-backup=true
-                - name: SEALED_SECRETS_NAMESPACE
-                  value: kube-system
                 - name: SEALED_SECRETS_KEY_SELECTOR
                   value: sealedsecrets.bitnami.com/sealed-secrets-key
                 - name: BACKUP_DIR
                   value: /backup
+                # Optional S3-compatible endpoint support.
+                # Leave S3_BUCKET empty to use node-local hostPath only.
+                - name: S3_BUCKET
+                  value: ""
+                - name: S3_PREFIX
+                  value: sealed-secrets-backup
+                # Examples: https://s3.eu-central-1.amazonaws.com, https://minio.example.com.
+                # Leave empty for AWS S3's default endpoint resolution.
+                - name: S3_ENDPOINT_URL
+                  value: ""
+                - name: WORKER_TIMEOUT
+                  value: 180s
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
@@ -54,14 +61,8 @@ spec:
                 - name: script
                   mountPath: /scripts
                   readOnly: true
-                - name: backup
-                  mountPath: /backup
           volumes:
             - name: script
               configMap:
                 name: sealed-secrets-key-backup-script
                 defaultMode: 0555
-            - name: backup
-              hostPath:
-                path: /var/lib/sealed-secrets-backup
-                type: DirectoryOrCreate

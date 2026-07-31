@@ -2,7 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: sealed-secrets-backup-label-check
-  namespace: sealed-secrets-backup
 spec:
   replicas: 1
   selector:
