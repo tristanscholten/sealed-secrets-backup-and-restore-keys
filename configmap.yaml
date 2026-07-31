@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sealed-secrets-key-backup-script
+  namespace: sealed-secrets-backup
+data:
+  backup.sh: |
+    #!/bin/sh
+    set -eu
+
+    mode="${MODE:-backup}"
+    node_label="${BACKUP_NODE_LABEL:-sealed-secrets-backup=true}"
+    key_namespace="${SEALED_SECRETS_NAMESPACE:-kube-system}"
+    key_selector="${SEALED_SECRETS_KEY_SELECTOR:-sealedsecrets.bitnami.com/sealed-secrets-key}"
+    backup_dir="${BACKUP_DIR:-/backup}"
+    node_name="${NODE_NAME:-}"
+
+    labeled_nodes="$(kubectl get nodes -l "${node_label}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
+    node_count="$(printf '%s\n' "${labeled_nodes}" | sed '/^$/d' | wc -l | tr -d ' ')"
+
+    if [ "${node_count}" -eq 0 ]; then
+      echo "ERROR: no node has required label ${node_label}; label exactly one backup node." >&2
+      exit 1
+    fi
+
+    if [ "${node_count}" -gt 1 ]; then
+      echo "ERROR: multiple nodes have ${node_label}; label exactly one backup node." >&2
+      printf '%s\n' "${labeled_nodes}" >&2
+      exit 1
+    fi
+
+    target_node="$(printf '%s\n' "${labeled_nodes}" | sed '/^$/d' | head -n1)"
+
+    if [ "${mode}" = "check" ]; then
+      echo "OK: backup node ${target_node} has ${node_label}."
+      sleep 3600
+      exit 0
+    fi
+
+    if [ -n "${node_name}" ] && [ "${node_name}" != "${target_node}" ]; then
+      echo "ERROR: scheduled on ${node_name}, but labeled backup node is ${target_node}." >&2
+      exit 1
+    fi
+
+    key_count="$(kubectl -n "${key_namespace}" get secrets -l "${key_selector}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${key_count}" -eq 0 ]; then
+      echo "ERROR: found no sealed-secrets private key secrets in ${key_namespace} with selector ${key_selector}." >&2
+      exit 1
+    fi
+
+    mkdir -p "${backup_dir}"
+    umask 077
+    tmp="${backup_dir}/sealed-secrets-keys.yaml.tmp"
+    latest="${backup_dir}/sealed-secrets-keys.yaml"
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    stamped="${backup_dir}/sealed-secrets-keys-${stamp}.yaml"
+    meta="${backup_dir}/sealed-secrets-keys.latest.txt"
+
+    kubectl -n "${key_namespace}" get secrets -l "${key_selector}" -o yaml > "${tmp}"
+    chmod 600 "${tmp}"
+    cp "${tmp}" "${stamped}"
+    chmod 600 "${stamped}"
+    mv "${tmp}" "${latest}"
+    chmod 600 "${latest}"
+
+    {
+      echo "timestamp=${stamp}"
+      echo "node=${target_node}"
+      echo "namespace=${key_namespace}"
+      echo "selector=${key_selector}"
+      echo "secret_count=${key_count}"
+      echo "latest=${latest}"
+      echo "stamped=${stamped}"
+    } > "${meta}"
+    chmod 600 "${meta}"
+
+    echo "OK: backed up ${key_count} sealed-secrets key secret(s) to ${latest} on node ${target_node}."

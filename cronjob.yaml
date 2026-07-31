@@ -1,0 +1,67 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sealed-secrets-key-backup
+  namespace: sealed-secrets-backup
+spec:
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: sealed-secrets-key-backup
+        spec:
+          serviceAccountName: sealed-secrets-key-backup
+          automountServiceAccountToken: true
+          restartPolicy: OnFailure
+          nodeSelector:
+            sealed-secrets-backup: "true"
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              image: docker.io/alpine/k8s:1.35.0
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/scripts/backup.sh"]
+              env:
+                - name: MODE
+                  value: backup
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
+                - name: BACKUP_NODE_LABEL
+                  value: sealed-secrets-backup=true
+                - name: SEALED_SECRETS_NAMESPACE
+                  value: kube-system
+                - name: SEALED_SECRETS_KEY_SELECTOR
+                  value: sealedsecrets.bitnami.com/sealed-secrets-key
+                - name: BACKUP_DIR
+                  value: /backup
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: backup
+                  mountPath: /backup
+          volumes:
+            - name: script
+              configMap:
+                name: sealed-secrets-key-backup-script
+                defaultMode: 0555
+            - name: backup
+              hostPath:
+                path: /var/lib/sealed-secrets-backup
+                type: DirectoryOrCreate
