@@ -2,7 +2,17 @@
 
 Tiny Kubernetes backup for Bitnami Sealed Secrets controller private keys.
 
-Deploy it once. It finds every Secret with the standard Sealed Secrets key label, groups backups by controller namespace, and writes them to **one or more** labeled nodes.
+Deploy it once. It finds every Secret with the standard Sealed Secrets key label, groups backups by controller namespace, and writes them to at least one configured backup target.
+
+Supported backup targets:
+
+- node-local hostPath on one or more labeled nodes
+- S3-compatible bucket endpoint
+- both at the same time
+
+If neither target is configured, the CronJob fails loudly.
+
+## Node-local backup layout
 
 Every labeled node gets controller-specific local copies:
 
@@ -14,7 +24,17 @@ Every labeled node gets controller-specific local copies:
 
 This prevents multiple Sealed Secrets controllers from overwriting each other's hostPath backup files.
 
-Optionally, each node backup can also be uploaded to an S3-compatible bucket endpoint.
+## S3 backup layout
+
+If `S3_BUCKET` is configured, backups are also uploaded to:
+
+```text
+s3://<bucket>/<prefix>/<controller-namespace>/<target>/sealed-secrets-keys.yaml
+s3://<bucket>/<prefix>/<controller-namespace>/<target>/sealed-secrets-keys-<timestamp>.yaml
+s3://<bucket>/<prefix>/<controller-namespace>/<target>/sealed-secrets-keys.latest.txt
+```
+
+`<target>` is the sanitized node name when node-local backups are enabled. If S3 is the only configured target, `<target>` is `cluster`.
 
 Context7 source used: `/bitnami/sealed-secrets`. Bitnami docs say backup keys with:
 
@@ -31,12 +51,12 @@ kubectl delete pod -n kube-system -l app.kubernetes.io/name=sealed-secrets
 
 ## How it works
 
-- `sealed-secrets-backup-label-check` verifies at least one node has the configured label.
-- The CronJob lists all labeled nodes.
-- For every labeled node, the CronJob creates a short-lived worker Job pinned to that exact node.
+- The CronJob checks configured targets.
+- If one or more nodes have `sealed-secrets-backup=true`, it creates one worker Job pinned to each labeled node.
+- If no nodes are labeled but `S3_BUCKET` is set, it creates one unpinned S3-only worker Job.
 - Each worker lists all namespaces that contain Sealed Secrets key Secrets.
 - Each controller namespace gets its own hostPath subdirectory and S3 prefix.
-- If `S3_BUCKET` is configured, each worker also uploads `latest`, timestamped backup, and metadata files to S3.
+- If no labeled nodes and no `S3_BUCKET` exist, the CronJob fails without writing anything.
 
 No private key material is printed by the scripts. Logs only include counts, paths, node names, namespaces, and upload destinations.
 
@@ -67,24 +87,7 @@ kubectl -n sealed-secrets-backup wait \
   --timeout=300s
 ```
 
-If no node has `sealed-secrets-backup=true`, `sealed-secrets-backup-label-check` exits with an error and goes `CrashLoopBackOff`. The backup CronJob also fails loudly.
-
-## Optional single-namespace mode
-
-Default behavior is cluster-wide discovery of all Sealed Secrets key namespaces. That is the simplest and safest mode for clusters with multiple Sealed Secrets controllers.
-
-If you deliberately want to back up only one controller namespace, add this env var to the CronJob:
-
-```yaml
-- name: SEALED_SECRETS_NAMESPACE
-  value: kube-system
-```
-
-Most users should not set it.
-
-## Optional S3-compatible backup endpoint
-
-The container image includes `aws`, so AWS S3, MinIO, Ceph RGW, Garage, Cloudflare R2, and other S3-compatible endpoints can be used.
+## Deploy S3-only backups
 
 Create credentials as a Secret. Use your real endpoint credentials; do not commit them:
 
@@ -108,15 +111,30 @@ Configure the CronJob environment in `cronjob.yaml`:
 
 For normal AWS S3, leave `S3_ENDPOINT_URL` empty and set `AWS_DEFAULT_REGION` in the Secret.
 
-S3 object layout:
+Then deploy normally:
 
-```text
-s3://<bucket>/<prefix>/<controller-namespace>/<node>/sealed-secrets-keys.yaml
-s3://<bucket>/<prefix>/<controller-namespace>/<node>/sealed-secrets-keys-<timestamp>.yaml
-s3://<bucket>/<prefix>/<controller-namespace>/<node>/sealed-secrets-keys.latest.txt
+```bash
+kubectl apply -k .
 ```
 
-Each labeled node uploads its own copy under the sanitized controller namespace and node name. The contents should be identical for a healthy cluster, but per-node paths make it obvious which nodes successfully wrote/uploaded a backup.
+No node label is required when `S3_BUCKET` is configured.
+
+## Deploy both node-local and S3 backups
+
+Configure `S3_BUCKET`, then also label one or more nodes. Each labeled node writes a hostPath backup and uploads its own S3 copy under that node name.
+
+## Optional single-namespace mode
+
+Default behavior is cluster-wide discovery of all Sealed Secrets key namespaces. That is the simplest and safest mode for clusters with multiple Sealed Secrets controllers.
+
+If you deliberately want to back up only one controller namespace, add this env var to the CronJob:
+
+```yaml
+- name: SEALED_SECRETS_NAMESPACE
+  value: kube-system
+```
+
+Most users should not set it.
 
 ## Restore from node-local backup
 
@@ -137,7 +155,18 @@ Then sync GitOps again.
 
 ## Restore from S3-compatible storage
 
-Download either the latest backup or a timestamped backup from one node prefix:
+Download either the latest backup or a timestamped backup from one prefix.
+
+S3-only example:
+
+```bash
+aws --endpoint-url https://minio.example.com \
+  s3 cp \
+  s3://my-sealed-secrets-backups/sealed-secrets-backup/prod/<controller-namespace>/cluster/sealed-secrets-keys.yaml \
+  sealed-secrets-keys.yaml
+```
+
+Node + S3 example:
 
 ```bash
 aws --endpoint-url https://minio.example.com \
@@ -146,13 +175,7 @@ aws --endpoint-url https://minio.example.com \
   sealed-secrets-keys.yaml
 ```
 
-For AWS S3, omit `--endpoint-url`:
-
-```bash
-aws s3 cp \
-  s3://my-sealed-secrets-backups/sealed-secrets-backup/prod/<controller-namespace>/<node>/sealed-secrets-keys.yaml \
-  sealed-secrets-keys.yaml
-```
+For AWS S3, omit `--endpoint-url`.
 
 Apply it to the rebuilt cluster:
 
