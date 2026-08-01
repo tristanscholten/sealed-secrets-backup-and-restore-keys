@@ -50,6 +50,10 @@ spec:
                 # Leave empty for AWS S3's default endpoint resolution.
                 - name: S3_ENDPOINT_URL
                   value: ""
+                # Optional. Overrides AWS_DEFAULT_REGION from the S3 credential Secret when set.
+                # Examples: eu-central-1, us-east-1, auto.
+                - name: S3_REGION
+                  value: ""
                 - name: WORKER_TIMEOUT
                   value: 180s
               securityContext:
