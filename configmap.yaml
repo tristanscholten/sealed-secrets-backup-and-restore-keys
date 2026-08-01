@@ -18,6 +18,7 @@ data:
     s3_bucket="${S3_BUCKET:-}"
     s3_prefix="${S3_PREFIX:-sealed-secrets-backup}"
     s3_endpoint_url="${S3_ENDPOINT_URL:-}"
+    s3_region="${S3_REGION:-}"
     worker_timeout="${WORKER_TIMEOUT:-180s}"
     host_backup="${HOST_BACKUP:-false}"
 
@@ -44,6 +45,7 @@ data:
       job_name="$1"
       target="$2"
       use_host="$3"
+      worker_s3_bucket="${4:-}"
 
       if [ "${use_host}" = "true" ]; then
         cat <<EOF | kubectl -n "${job_namespace}" apply -f -
@@ -95,11 +97,13 @@ data:
                 - name: BACKUP_DIR
                   value: "${backup_dir}"
                 - name: S3_BUCKET
-                  value: "${s3_bucket}"
+                  value: "${worker_s3_bucket}"
                 - name: S3_PREFIX
                   value: "${s3_prefix}"
                 - name: S3_ENDPOINT_URL
                   value: "${s3_endpoint_url}"
+                - name: S3_REGION
+                  value: "${s3_region}"
                 - name: AWS_ACCESS_KEY_ID
                   valueFrom:
                     secretKeyRef:
@@ -184,11 +188,13 @@ data:
                 - name: BACKUP_DIR
                   value: "${backup_dir}"
                 - name: S3_BUCKET
-                  value: "${s3_bucket}"
+                  value: "${worker_s3_bucket}"
                 - name: S3_PREFIX
                   value: "${s3_prefix}"
                 - name: S3_ENDPOINT_URL
                   value: "${s3_endpoint_url}"
+                - name: S3_REGION
+                  value: "${s3_region}"
                 - name: AWS_ACCESS_KEY_ID
                   valueFrom:
                     secretKeyRef:
@@ -264,13 +270,13 @@ data:
         short_node="$(sanitize_name "${node}")"
         job_name="ss-key-backup-${short_node}-${stamp}"
         created_jobs="${created_jobs} ${job_name}"
-        create_worker_job "${job_name}" "${node}" true
+        create_worker_job "${job_name}" "${node}" true ""
       done
 
-      if [ "${node_count}" -eq 0 ] && [ "${s3_enabled}" = "true" ]; then
+      if [ "${s3_enabled}" = "true" ]; then
         job_name="ss-key-backup-s3-${stamp}"
         created_jobs="${created_jobs} ${job_name}"
-        create_worker_job "${job_name}" cluster false
+        create_worker_job "${job_name}" cluster false "${s3_bucket}"
       fi
 
       failed=0
@@ -290,7 +296,8 @@ data:
 
       if [ "${node_count}" -gt 0 ]; then
         echo "OK: backed up sealed-secrets keys to ${node_count} labeled node(s)."
-      else
+      fi
+      if [ "${s3_enabled}" = "true" ]; then
         echo "OK: backed up sealed-secrets keys to S3 bucket ${s3_bucket}."
       fi
       exit 0
@@ -373,11 +380,15 @@ data:
       chmod 600 "${meta}"
 
       if [ -n "${s3_bucket}" ]; then
-        s3_target="$(sanitize_name "${target_node}")"
-        s3_base="s3://${s3_bucket}/${s3_prefix}/${backup_id}/${s3_target}"
+        s3_base="s3://${s3_bucket}/${s3_prefix}/${backup_id}"
         endpoint_args=""
         if [ -n "${s3_endpoint_url}" ]; then
           endpoint_args="--endpoint-url ${s3_endpoint_url}"
+        fi
+
+        if [ -n "${s3_region}" ]; then
+          export AWS_DEFAULT_REGION="${s3_region}"
+          export AWS_REGION="${s3_region}"
         fi
 
         # shellcheck disable=SC2086

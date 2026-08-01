@@ -29,12 +29,12 @@ This prevents multiple Sealed Secrets controllers from overwriting each other's 
 If `S3_BUCKET` is configured, backups are also uploaded to:
 
 ```text
-s3://<bucket>/<prefix>/<controller-namespace>/<target>/sealed-secrets-keys.yaml
-s3://<bucket>/<prefix>/<controller-namespace>/<target>/sealed-secrets-keys-<timestamp>.yaml
-s3://<bucket>/<prefix>/<controller-namespace>/<target>/sealed-secrets-keys.latest.txt
+s3://<bucket>/<prefix>/<controller-namespace>/sealed-secrets-keys.yaml
+s3://<bucket>/<prefix>/<controller-namespace>/sealed-secrets-keys-<timestamp>.yaml
+s3://<bucket>/<prefix>/<controller-namespace>/sealed-secrets-keys.latest.txt
 ```
 
-`<target>` is the sanitized node name when node-local backups are enabled. If S3 is the only configured target, `<target>` is `cluster`.
+There is no extra node or target path segment. Use `S3_PREFIX` to differentiate cluster, environment, tenant, or destination.
 
 Context7 source used: `/bitnami/sealed-secrets`. Bitnami docs say backup keys with:
 
@@ -52,10 +52,10 @@ kubectl delete pod -n kube-system -l app.kubernetes.io/name=sealed-secrets
 ## How it works
 
 - The CronJob checks configured targets.
-- If one or more nodes have `sealed-secrets-backup=true`, it creates one worker Job pinned to each labeled node.
-- If no nodes are labeled but `S3_BUCKET` is set, it creates one unpinned S3-only worker Job.
+- If one or more nodes have `sealed-secrets-backup=true`, it creates one hostPath worker Job pinned to each labeled node.
+- If `S3_BUCKET` is set, it creates one unpinned S3 worker Job.
 - Each worker lists all namespaces that contain Sealed Secrets key Secrets.
-- Each controller namespace gets its own hostPath subdirectory and S3 prefix.
+- Each controller namespace gets its own hostPath subdirectory and S3 path below `S3_PREFIX`.
 - If no labeled nodes and no `S3_BUCKET` exist, the CronJob fails without writing anything.
 
 No private key material is printed by the scripts. Logs only include counts, paths, node names, namespaces, and upload destinations.
@@ -107,9 +107,11 @@ Configure the CronJob environment in `cronjob.yaml`:
   value: sealed-secrets-backup/prod
 - name: S3_ENDPOINT_URL
   value: https://minio.example.com
+- name: S3_REGION
+  value: eu-central-1
 ```
 
-For normal AWS S3, leave `S3_ENDPOINT_URL` empty and set `AWS_DEFAULT_REGION` in the Secret.
+For normal AWS S3, leave `S3_ENDPOINT_URL` empty and set `S3_REGION` to the bucket region. `S3_REGION` overrides `AWS_DEFAULT_REGION` from the Secret when both are set. Some S3-compatible providers use values such as `auto`.
 
 Then deploy normally:
 
@@ -121,7 +123,7 @@ No node label is required when `S3_BUCKET` is configured.
 
 ## Deploy both node-local and S3 backups
 
-Configure `S3_BUCKET`, then also label one or more nodes. Each labeled node writes a hostPath backup and uploads its own S3 copy under that node name.
+Configure `S3_BUCKET`, then also label one or more nodes. Labeled nodes write hostPath backups, and one separate S3 worker uploads one remote copy without a node/target path segment.
 
 ## Optional single-namespace mode
 
@@ -162,16 +164,7 @@ S3-only example:
 ```bash
 aws --endpoint-url https://minio.example.com \
   s3 cp \
-  s3://my-sealed-secrets-backups/sealed-secrets-backup/prod/<controller-namespace>/cluster/sealed-secrets-keys.yaml \
-  sealed-secrets-keys.yaml
-```
-
-Node + S3 example:
-
-```bash
-aws --endpoint-url https://minio.example.com \
-  s3 cp \
-  s3://my-sealed-secrets-backups/sealed-secrets-backup/prod/<controller-namespace>/<node>/sealed-secrets-keys.yaml \
+  s3://my-sealed-secrets-backups/sealed-secrets-backup/prod/<controller-namespace>/sealed-secrets-keys.yaml \
   sealed-secrets-keys.yaml
 ```
 
@@ -195,3 +188,4 @@ Validate by applying or syncing a known-good `SealedSecret` and confirming the c
 - Node label: `sealed-secrets-backup=true`
 - Host path on every labeled node: `/var/lib/sealed-secrets-backup/<controller-namespace>`
 - S3 upload: disabled until `S3_BUCKET` is set
+- S3 region override: disabled until `S3_REGION` is set; otherwise AWS CLI uses `AWS_DEFAULT_REGION` from the Secret/config
