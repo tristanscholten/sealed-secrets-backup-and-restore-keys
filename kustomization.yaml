@@ -7,5 +7,4 @@ resources:
   - namespace.yaml
   - rbac.yaml
   - configmap.yaml
-  - label-check-deployment.yaml
   - cronjob.yaml
